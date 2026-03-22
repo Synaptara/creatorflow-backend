@@ -26,3 +26,4 @@ python-dotenv==1.0.1             # Load .env in local development
 pydantic==2.7.1                  # Bundled with FastAPI but pinned for safety
 httpx==0.27.0                    # Async HTTP (used by FastAPI test client)
 razorpay
+slowapi
