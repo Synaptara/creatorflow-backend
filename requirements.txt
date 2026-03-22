@@ -1,0 +1,27 @@
+# CreatorFlow — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ── Web framework ──────────────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.30.1        # ASGI server (includes uvloop + httptools)
+
+# ── Scheduler ──────────────────────────────────────────────────────────────
+apscheduler==3.10.4
+
+# ── Firebase ───────────────────────────────────────────────────────────────
+firebase-admin==6.5.0
+google-cloud-firestore==2.16.0
+
+# ── Google APIs ────────────────────────────────────────────────────────────
+google-api-python-client==2.131.0
+google-auth==2.29.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.0
+
+# ── Groq ───────────────────────────────────────────────────────────────────
+groq==0.8.0
+
+# ── Utilities ──────────────────────────────────────────────────────────────
+python-dotenv==1.0.1             # Load .env in local development
+pydantic==2.7.1                  # Bundled with FastAPI but pinned for safety
+httpx==0.27.0                    # Async HTTP (used by FastAPI test client)
