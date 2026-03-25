@@ -144,7 +144,6 @@ rzp_client     = razorpay.Client(auth=(KEY_ID, KEY_SECRET))
 # ── GOOGLE OAUTH SETUP ──
 SCOPES = [
     'https://www.googleapis.com/auth/drive.file',
-    'https://www.googleapis.com/auth/drive.readonly',
     'https://www.googleapis.com/auth/youtube.upload',
     'openid',
     'https://www.googleapis.com/auth/userinfo.email'

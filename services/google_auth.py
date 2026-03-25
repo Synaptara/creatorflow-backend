@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 GOOGLE_TOKEN_URI: Final[str] = "https://oauth2.googleapis.com/token"
 
 REQUIRED_SCOPES: Final[list[str]] = [
-    "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/userinfo.email",
