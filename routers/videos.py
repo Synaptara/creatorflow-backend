@@ -3,7 +3,7 @@ CreatorFlow — routers/videos.py
 FastAPI router for video management.
 
 Endpoints:
-  POST   /api/videos/upload/{video_id}      — Trigger a YouTube upload (background task)
+  POST   /api/videos/upload/{video_id}      — Trigger a YouTube upload (or instant publish)
   GET    /api/videos/{video_id}/status      — Fetch current upload status
   GET    /api/videos/user/{user_id}         — List all videos for a user
   POST   /api/videos/{video_id}/retry       — Retry a failed upload
@@ -13,9 +13,10 @@ Endpoints:
 import logging
 from typing import Literal
 import asyncio
+from datetime import datetime, timedelta, timezone as tz
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from database import get_db
 from dependencies import verify_firebase_token
@@ -238,9 +239,10 @@ async def retry_upload(
     background_tasks: BackgroundTasks,
     uid: str = Depends(verify_firebase_token),
 ) -> UploadAcceptedResponse:
+
     db = get_db()
     video_ref = db.collection("videos").document(video_id)
-    doc = video_ref.get()
+    doc       = video_ref.get()
 
     if not doc.exists:
         raise HTTPException(
@@ -256,7 +258,6 @@ async def retry_upload(
         )
 
     current_status: str = data.get("status", "")
-
     if current_status == "success":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -268,17 +269,35 @@ async def retry_upload(
             detail="An upload is already in progress.",
         )
 
-    # Reset to scheduled so YouTubeUploader's guard doesn't block it
-    video_ref.update({
-        "status": "scheduled",
-        "errorMessage": None,
-        "uploadFailedAt": None,
-    })
+    # ── FIX: If the stored publishAt is in the past (or within 30 min), clear it.
+    # The original poller scheduled the video for "tomorrow", but if the first
+    # upload failed and the user retries the next day, publishAt is now stale.
+    # YouTubeUploader._validate_publish_at() also guards against this, but
+    # clearing it here keeps Firestore consistent with what YouTube will receive.
+    update_fields: dict = {
+        "status":          "scheduled",
+        "errorMessage":    None,
+        "uploadFailedAt":  None,
+    }
+    raw_publish_at: str | None = data.get("publishAt")
+    if raw_publish_at:
+        try:
+            pub_dt  = datetime.fromisoformat(raw_publish_at.replace("Z", "+00:00"))
+            cutoff  = datetime.now(tz.utc) + timedelta(minutes=30)
+            if pub_dt <= cutoff:
+                update_fields["publishAt"] = None   # treat as immediate upload
+                logger.info(
+                    "[Router] Cleared stale publishAt '%s' on retry for videoId='%s'",
+                    raw_publish_at, video_id,
+                )
+        except (ValueError, AttributeError):
+            update_fields["publishAt"] = None
+
+    video_ref.update(update_fields)
 
     logger.info("[Router] Retry triggered — videoId='%s'", video_id)
     uploader = YouTubeUploader(video_id)
 
-    # 👇 Wrap retries in the lock too!
     async def locked_retry():
         async with upload_lock:
             await uploader.execute_upload()
@@ -327,3 +346,43 @@ async def delete_video(
 
     video_ref.delete()
     logger.info("[Router] Video record deleted — videoId='%s'", video_id)
+
+
+# ---------------------------------------------------------------------------
+# POST /{video_id}/publish
+# ---------------------------------------------------------------------------
+
+class PublishRequest(BaseModel):
+    userId: str
+
+@router.post(
+    "/{video_id}/publish",
+    response_model=UploadAcceptedResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Instantly publish a scheduled video",
+)
+async def publish_video_now(
+    video_id: str,
+    body: PublishRequest,
+    uid: str = Depends(verify_firebase_token),
+):
+    db = get_db()
+    doc = db.collection("videos").document(video_id).get()
+
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Video not found.")
+
+    if (doc.to_dict() or {}).get("userId") != uid:
+        raise HTTPException(status_code=403, detail="Permission denied.")
+
+    try:
+        uploader = YouTubeUploader(video_id)
+        await uploader.make_video_public()
+        return UploadAcceptedResponse(
+            message="Video is now live!",
+            videoId=video_id,
+            status="success"
+        )
+    except Exception as e:
+        logger.error("[Router] Publish failed for '%s': %s", video_id, e)
+        raise HTTPException(status_code=500, detail="Failed to make video public.")

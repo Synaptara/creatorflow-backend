@@ -1,0 +1,11 @@
+Found 2 failed videos.
+Video ID: 7c1agFdls4awcIjFGK4o
+Title: D-Day Chaos - Battlefield V Gameplay
+Error Message: <HttpError 403 when requesting https://www.googleapis.com/drive/v3/files/1AHKn8wNMfYal7QbNxxycNpSyequrj2l4?fields=size&alt=json returned "Request had insufficient authentication scopes.". Details: "[{'message': 'Insufficient Permission', 'domain': 'global', 'reason': 'insufficientPermissions'}]">
+Upload Failed At: 2026-03-26 05:27:06.215000+00:00
+----------------------------------------
+Video ID: NHQma5POz7BdG7mH7nfZ
+Title: Digital Culture in 2025: The Future Unveiled
+Error Message: ('invalid_scope: Bad Request', {'error': 'invalid_scope', 'error_description': 'Bad Request'})
+Upload Failed At: 2026-03-26 08:15:36.100000+00:00
+----------------------------------------

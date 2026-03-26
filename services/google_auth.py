@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 GOOGLE_TOKEN_URI: Final[str] = "https://oauth2.googleapis.com/token"
 
 REQUIRED_SCOPES: Final[list[str]] = [
-    "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
@@ -46,14 +45,6 @@ class GoogleAuthManager:
             creds = self._refresh_and_persist(creds)
 
         return creds
-
-    def build_drive_service(self) -> Resource:
-        return build(
-            "drive",
-            "v3",
-            credentials=self.get_credentials(),
-            cache_discovery=False,
-        )
 
     def build_youtube_service(self) -> Resource:
         return build(
