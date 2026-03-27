@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Final
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,7 +40,7 @@ class DrivePoller:
     def __init__(self) -> None:
         self._db           = get_db()
         self._groq         = GroqGenerator()
-        self._drive_service = self._build_drive_service()
+        # FIX 1: Removed shared _drive_service instance to prevent SSL multi-threading crashes
 
     def _build_drive_service(self):
         if not os.path.isfile(SERVICE_ACCOUNT_FILE):
@@ -146,9 +147,10 @@ class DrivePoller:
         if not new_files:
             return 0
 
-        # Intake quota check
+        # FIX 3: Fetch user_doc once and pass the data forward
         user_doc  = self._db.collection("users").document(user_id).get()
-        user_plan = (user_doc.to_dict() or {}).get("plan", "creator")
+        user_data = user_doc.to_dict() or {}
+        user_plan = user_data.get("plan", "creator")
         daily_limit = 6 if user_plan == "studio" else 2
 
         all_vids       = self._db.collection("videos").where("userId", "==", user_id).select(["createdAt"]).stream()
@@ -183,7 +185,8 @@ class DrivePoller:
 
         count = 0
         for f in files_to_process:
-            await self._queue_new_video(user_id, f, category=category, tags=tags)
+            # Pass user_data to prevent double fetching
+            await self._queue_new_video(user_id, f, user_data, category=category, tags=tags)
             count += 1
 
         return count
@@ -193,8 +196,9 @@ class DrivePoller:
     # ------------------------------------------------------------------
 
     def _list_drive_videos(self, folder_id: str) -> list[dict]:
-        # 🔥 FIX: We removed the strict 'mimeType' checking here so Drive doesn't
-        # hide files that are still processing. We just ask for EVERYTHING in the folder.
+        # FIX 1: Instantiate fresh Drive client per thread
+        drive_service = self._build_drive_service()
+
         query = (
             f"('{folder_id}' in parents)"
             f" and trashed=false"
@@ -214,7 +218,17 @@ class DrivePoller:
                 )
                 if page_token:
                     kwargs["pageToken"] = page_token
-                response   = self._drive_service.files().list(**kwargs).execute()
+
+                # FIX 2: Retry logic with exponential backoff for SSL timeouts
+                for attempt in range(3):
+                    try:
+                        response = drive_service.files().list(**kwargs).execute()
+                        break
+                    except Exception:
+                        if attempt == 2:
+                            raise
+                        time.sleep(2 ** attempt)
+
                 all_files.extend(response.get("files", []))
 
                 if len(all_files) >= MAX_DRIVE_FILES_PER_POLL:
@@ -228,7 +242,6 @@ class DrivePoller:
             logger.error("[Poller] Drive API list failed for folder '%s': %s", folder_id, exc)
             raise
 
-        # 🔥 FIX: We explicitly log EVERY file Google Drive allows us to see
         if not all_files:
             logger.info("[Poller] 👁️  Folder is empty or Bot has no permissions.")
 
@@ -238,7 +251,6 @@ class DrivePoller:
             mime = f.get("mimeType", "Unknown")
             ext = Path(name).suffix.lower()
 
-            # Print everything it sees!
             logger.info("[Poller] 👁️  Found file in Drive: '%s' (MIME: %s)", name, mime)
 
             if ext in SUPPORTED_EXTENSIONS:
@@ -254,10 +266,12 @@ class DrivePoller:
     # ------------------------------------------------------------------
 
     def _get_known_drive_ids(self, user_id: str) -> set[str]:
+        # FIX 4: Implemented query limitation to 1000 items
         docs = (
             self._db.collection("videos")
             .where("userId", "==", user_id)
             .select(["driveFileId"])
+            .limit(1000)
             .stream()
         )
         return {(doc.to_dict() or {}).get("driveFileId") for doc in docs} - {None}
@@ -266,6 +280,7 @@ class DrivePoller:
         self,
         user_id: str,
         file_info: dict,
+        user_data: dict,
         category: str | None = None,
         tags: list[str] | None = None,
     ) -> None:
@@ -282,8 +297,8 @@ class DrivePoller:
         settings_doc = self._db.collection("settings").document(user_id).get()
         settings     = settings_doc.to_dict() or {}
 
-        user_doc  = self._db.collection("users").document(user_id).get()
-        user_plan = (user_doc.to_dict() or {}).get("plan", "creator")
+        # Pulled from user_data passed down
+        user_plan = user_data.get("plan", "creator")
 
         ai_enabled = settings.get("aiGen", True)
 
@@ -358,8 +373,8 @@ class DrivePoller:
         tz_str            = settings.get("timezone", "UTC +00:00")
         tz_offset_minutes = 0
         try:
-            import re as _re
-            tz_match = _re.search(r'([+-])(\d{1,2}):(\d{2})', tz_str)
+            # FIX 5: Removed inline import re as _re, referencing top-level re
+            tz_match = re.search(r'([+-])(\d{1,2}):(\d{2})', tz_str)
             if tz_match:
                 sign = 1 if tz_match.group(1) == '+' else -1
                 tz_offset_minutes = sign * (
@@ -372,6 +387,7 @@ class DrivePoller:
         utc_publish    = (local_naive - timedelta(minutes=tz_offset_minutes)).replace(tzinfo=timezone.utc)
         iso_publish_at = utc_publish.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # FIX 6: Write Category and Tags directly to Firestore Document payload
         new_doc: dict = {
             "userId":        user_id,
             "title":         title,
@@ -382,6 +398,8 @@ class DrivePoller:
             "publishAt":     iso_publish_at,
             "date":          target_date.strftime("%Y-%m-%d"),
             "createdAt":     fs.SERVER_TIMESTAMP,
+            "category":      category or "",
+            "tags":          tags or [],
         }
         new_ref = self._db.collection("videos").document()
         new_ref.set(new_doc)
