@@ -9,11 +9,11 @@ logger = logging.getLogger(__name__)
 
 class EmailDispatcher:
     def __init__(self):
-        # We use Gmail's SMTP server
-        self.smtp_server = "smtp.gmail.com"
+
+        self.smtp_server = "smtp.zoho.in"
         self.smtp_port = 587
-        self.sender_email = os.getenv("EMAIL_USER")  # Your Gmail address
-        self.sender_password = os.getenv("EMAIL_PASS")  # Your Gmail App Password
+        self.sender_email = os.getenv("EMAIL_USER")
+        self.sender_password = os.getenv("EMAIL_PASS")
 
     def send_notification(self, user_id: str, subject: str, body_text: str):
         """Fetches the user's email from Firebase and sends them an alert."""
@@ -32,12 +32,13 @@ class EmailDispatcher:
 
             # 2. Build the email payload
             msg = MIMEMultipart()
-            msg['From'] = f"CreatorFlow Alerts <{self.sender_email}>"
+            # 🔥 FIX 2: Rebranded the sender name to match your new domain
+            msg['From'] = f"Updrop <{self.sender_email}>"
             msg['To'] = recipient_email
             msg['Subject'] = subject
             msg.attach(MIMEText(body_text, 'plain'))
 
-            # 3. Fire it off via Gmail SMTP
+            # 3. Fire it off via Zoho SMTP
             with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
                 server.starttls()
                 server.login(self.sender_email, self.sender_password)
