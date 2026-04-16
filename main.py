@@ -256,7 +256,7 @@ WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET")
 rzp_client     = razorpay.Client(auth=(KEY_ID, KEY_SECRET))
 
 SCOPES = [
-    'https://www.googleapis.com/auth/youtube',
+    'https://www.googleapis.com/auth/youtube.upload',
     'openid',
     'https://www.googleapis.com/auth/userinfo.email'
 ]
