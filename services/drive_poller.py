@@ -84,7 +84,15 @@ class DrivePoller:
 
     async def poll_all_users(self) -> None:
         logger.info("══════ Drive Watcher: Cycle START ══════")
-        users_stream = self._db.collection("users").stream()
+
+        # 🔥 THE WALLET FIX: Ask Firestore to ONLY return users who have a folder.
+        # This prevents 100 empty user profiles from costing you 100 DB reads every cycle.
+        from google.cloud.firestore_v1.base_query import FieldFilter
+        users_stream = (
+            self._db.collection("users")
+            .where(filter=FieldFilter("driveFolderId", ">", ""))
+            .stream()
+        )
 
         processed = skipped = errors = 0
         tasks = []
@@ -92,9 +100,11 @@ class DrivePoller:
         for user_doc in users_stream:
             user_id:   str        = user_doc.id
             folder_id: str | None = (user_doc.to_dict() or {}).get("driveFolderId")
+
             if not folder_id:
                 skipped += 1
                 continue
+
             tasks.append(self._safe_process_user(user_id, folder_id))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)

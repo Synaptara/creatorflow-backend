@@ -15,7 +15,10 @@ from dotenv import load_dotenv
 from google_auth_oauthlib.flow import Flow
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 from slowapi import Limiter, _rate_limit_exceeded_handler
+
+from services.email_service import EmailDispatcher
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
@@ -25,9 +28,7 @@ from services.drive_poller import DrivePoller
 from dependencies import verify_firebase_token
 
 # ── FIX: Import the shared upload lock so scheduler and BackgroundTasks
-# use the EXACT same serialisation gate. Without this, a scheduler run
-# and a manual retry can call execute_upload() concurrently on the same
-# video, corrupting Firestore state.
+# use the EXACT same serialisation gate.
 from routers.videos import upload_lock
 
 if os.getenv("ENVIRONMENT") == "development":
@@ -44,19 +45,8 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 limiter = Limiter(key_func=get_remote_address)
 
 
-# ── FIX: Extracted as a module-level coroutine factory so APScheduler
-# schedules a clean reference instead of a lifespan-closure.
-# More importantly, each video is dispatched as its own asyncio.Task —
-# exactly what FastAPI's BackgroundTasks does internally — rather than
-# being awaited inline inside the scheduler job coroutine. This gives
-# each upload its own isolated stack frame, cancellation scope, and
-# thread-pool context, which is what makes BackgroundTasks reliable.
+# ── FIX: Extracted as a module-level coroutine factory
 async def _scheduler_upload_task(video_id: str, plan: str) -> None:
-    """
-    Mirrors the locked_retry() pattern in routers/videos.py exactly.
-    Runs as an independent asyncio.Task so the thread-pool context for
-    googleapiclient / google-auth is identical to the BackgroundTasks path.
-    """
     try:
         async with upload_lock:
             from services.youtube_uploader import YouTubeUploader
@@ -67,26 +57,92 @@ async def _scheduler_upload_task(video_id: str, plan: str) -> None:
             uploader = YouTubeUploader(video_id)
             await uploader.execute_upload()
     except Exception:
-        # execute_upload() has its own internal try/except and always
-        # writes status='failed' to Firestore before re-raising nothing.
-        # This outer guard catches anything that leaks out (e.g. a bad
-        # video_id before the internal try block is reached) and ensures
-        # one bad video never silently kills the task.
         logger.error(
             "🚨 Scheduler upload task raised outside execute_upload — "
             "videoId='%s'. Check Firestore for status.",
-            video_id, exc_info=True,       # ← exc_info=True gives you the full
-        )                                  #   traceback so you can see the real error.
+            video_id, exc_info=True,
+        )
+
+# ── NEW: Daily Streak Cron Job ──
+async def daily_streak_monitor():
+    logger.info("🔍 Running Daily Streak Monitor & Emailer...")
+    try:
+        db = get_db()
+        users_ref = db.collection("users").stream()
+        email_dispatcher = EmailDispatcher()
+        now = datetime.now(timezone.utc)
+
+        for user_doc in users_ref:
+            user_data = user_doc.to_dict() or {}
+            user_id = user_doc.id
+
+            # 1. Find their latest published video
+            latest_video_query = (
+                db.collection("videos")
+                .where(filter=FieldFilter("userId", "==", user_id))
+                .where(filter=FieldFilter("status", "==", "success"))
+                .order_by("createdAt", direction="DESCENDING")
+                .limit(1)
+                .stream()
+            )
+
+            latest_vid = next(latest_video_query, None)
+            current_streak = user_data.get("currentStreak", 0)
+            has_uploaded_recently = False
+
+            if latest_vid:
+                vid_data = latest_vid.to_dict()
+                created_str = vid_data.get("createdAt")
+                if created_str:
+                    try:
+                        # Parse ISO format string to calculate time difference
+                        created_at = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                        hours_since_upload = (now - created_at).total_seconds() / 3600
+                        if hours_since_upload <= 24:
+                            has_uploaded_recently = True
+                    except Exception as e:
+                        logger.warning(f"Date parse error for video {latest_vid.id}: {e}")
+
+            # 2. Update Streak
+            new_streak = current_streak + 1 if has_uploaded_recently else 0
+
+            if new_streak != current_streak:
+                db.collection("users").document(user_id).update({"currentStreak": new_streak})
+
+            # 3. Send Email if they lost their streak & notifications are ON
+            if not has_uploaded_recently and user_data.get("streakNotificationsEnabled"):
+                subject = "⚠️ Keep your Updrop upload streak alive!"
+                body = (
+                    f"Hi there,\n\n"
+                    f"We noticed you haven't published a video in the last 24 hours. "
+                    f"Consistency is key to the YouTube algorithm!\n\n"
+                    f"Drop a new video in your Google Drive folder today to keep your streak going.\n\n"
+                    f"Happy creating,\nThe Updrop Team"
+                )
+                email_dispatcher.send_notification(user_id, subject, body)
+
+    except Exception as e:
+        logger.error(f"🚨 Error in daily_streak_monitor: {e}", exc_info=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 CreatorFlow Backend Starting Up...")
 
+    # ── NEW: Register the Streak Monitor to run daily at Midnight UTC ──
+    scheduler.add_job(
+        daily_streak_monitor,
+        trigger=CronTrigger(hour=0, minute=0, timezone="UTC"),
+        id="daily_streak_job",
+        name="Daily Streak Monitor & Notifier",
+        replace_existing=True,
+        max_instances=1,
+    )
+
     poller = DrivePoller()
     scheduler.add_job(
         poller.poll_all_users,
-        trigger=IntervalTrigger(seconds=30),
+        trigger=IntervalTrigger(minutes=5),  # 🔥 WALLET FIX: Changed from 30 seconds to 5 minutes
         id="drive_poll_job",
         name="Drive Folder Watcher",
         replace_existing=True,
@@ -113,9 +169,10 @@ async def lifespan(app: FastAPI):
             user_id = data.get("userId")
 
             if user_id not in user_plans_cache:
-                settings_doc = db.collection("settings").document(user_id).get()
+                # 🔥 CLAUDE'S FIX 1: Read plan from 'users', not 'settings'
+                user_doc = db.collection("users").document(user_id).get()
                 user_plans_cache[user_id] = (
-                    settings_doc.to_dict() or {}
+                    user_doc.to_dict() or {}
                 ).get("plan", "creator")
 
             plan           = user_plans_cache[user_id]
@@ -128,32 +185,28 @@ async def lifespan(app: FastAPI):
 
         videos_to_process.sort(key=lambda x: x["priority"])
 
-        # ── FIX: Dispatch each video as an independent asyncio.Task instead
-        # of awaiting execute_upload() inline.
-        #
-        # WHY THIS FIXES THE BUG:
-        # Previously:  await uploader.execute_upload()
-        #   → Runs INSIDE the scheduler coroutine's frame.
-        #   → run_in_executor threads inherit the scheduler job's context,
-        #     which may share httplib2/SSL state with the concurrent
-        #     DrivePoller (also using run_in_executor every 30 s).
-        #
-        # Now:  asyncio.create_task(_scheduler_upload_task(...))
-        #   → Each upload is an independent Task, exactly like BackgroundTasks.
-        #   → The task acquires upload_lock before calling execute_upload(),
-        #     so concurrent uploads (scheduler + manual retry) are serialised.
-        #   → Per-video isolation: one bad Task never affects the others.
-        #   → The scheduler job itself returns immediately after spawning
-        #     tasks, so it never blocks the event loop for a full upload cycle.
+        # 🔥 CLAUDE'S FIX 2: Memory Cap for 1GB Server (Max 5 Tasks)
+        MAX_TASKS_PER_CYCLE = 5
+        dispatched = 0
+
         for v in videos_to_process:
+            if dispatched >= MAX_TASKS_PER_CYCLE:
+                logger.info(
+                    "🚦 Priority Queue: task cap (%d) reached for this cycle. "
+                    "Remaining videos will be picked up next run.",
+                    MAX_TASKS_PER_CYCLE,
+                )
+                break
+
             asyncio.create_task(
                 _scheduler_upload_task(v["doc_id"], v["plan"]),
-                name=f"upload-{v['doc_id']}",   # visible in asyncio debug mode
+                name=f"upload-{v['doc_id']}",
             )
             logger.info(
                 "🚦 Priority Queue: dispatched task for videoId='%s' (Tier: %s)",
                 v["doc_id"], v["plan"].upper(),
             )
+            dispatched += 1
 
     scheduler.add_job(
         process_priority_queue,
@@ -298,7 +351,7 @@ class PreviewRequest(BaseModel):
 
 
 # ══════════════════════════════════════════════
-# ENDPOINTS  (all unchanged from your original)
+# ENDPOINTS
 # ══════════════════════════════════════════════
 
 @app.get("/")
